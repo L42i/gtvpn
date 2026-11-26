@@ -89,7 +89,7 @@ child.close()
 EOF
 )
 
-running() { [[ -f $PID_FILE ]] && sudo kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }
+running() { [[ -f $PID_FILE ]] && [[ -d /proc/$(cat "$PID_FILE") ]]; }
 
 connect() {
     if running; then echo "GT VPN already connected."; exit 0; fi
