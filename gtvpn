@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# gtvpn — one-command Georgia Tech GlobalProtect VPN via openconnect.
+#
+#   gtvpn          connect (Duo push2 sent automatically); stays in this terminal, Ctrl-C disconnects
+#   gtvpn off      disconnect (from another terminal)
+#   gtvpn status   show whether the tunnel is up
+#   gtvpn setup    (re)store GT username + password (password goes to KDE Wallet)
+#
+# Optional env: GTVPN_DUO       second-factor answer (default: push2; or push / phone / a passcode)
+#               GTVPN_GATEWAY   DC (default) or NI
+#               GTVPN_SERVER    host to log in to (default: vpn.gatech.edu portal, which then
+#                               logs in to the chosen gateway — two Duo pushes; set it to e.g.
+#                               dc-ext-gw.vpn.gatech.edu to log in to a gateway directly)
+set -euo pipefail
+
+CONF_DIR="$HOME/.config/gtvpn"
+USER_FILE="$CONF_DIR/user"
+PID_FILE=/run/gtvpn.pid
+
+# Password lives in KDE Wallet via the Secret Service API (python keyring).
+kr_get() { python3 -c 'import sys,keyring; p=keyring.get_password("gtvpn",sys.argv[1]); sys.exit(1) if not p else print(p)' "$1"; }
+kr_set() { python3 -c 'import sys,keyring; keyring.set_password("gtvpn",sys.argv[1],sys.stdin.read())' "$1"; }
+
+setup() {
+    mkdir -p "$CONF_DIR"
+    read -rp "GT username: " u
+    printf '%s\n' "$u" > "$USER_FILE"
+    read -rsp "GT password (stored in KDE Wallet): " p; echo
+    printf '%s' "$p" | kr_set "$u"
+    [[ $(kr_get "$u") == "$p" ]] || { echo "Failed to store password in KDE Wallet." >&2; exit 1; }
+    echo "Saved."
+}
+
+HELPER=$(cat <<'EOF'
+import signal, sys, pexpect
+
+server, usergroup, pid_file, user, duo, gateway = sys.argv[1:]
+password = sys.stdin.readline().rstrip("\n")
+args = ["--protocol=gp", f"--usergroup={usergroup}", "-u", user, f"--authgroup={gateway}",
+        "--csd-wrapper=/usr/libexec/openconnect/hipreport.sh",
+        f"--pid-file={pid_file}", server]
+
+child = pexpect.spawn("openconnect", args, encoding="utf-8", timeout=30)
+child.logfile_read = sys.stdout
+
+prompts = [
+    r"Password:",                 # 0 GT password
+    r"Challenge:",                # 1 Duo
+    r"GATEWAY: \[[^\]]*\]:",       # 2 gateway choice
+    r"Username:",                 # 3
+    r"Connected as",              # 4 tunnel up
+    pexpect.EOF,                  # 5
+    pexpect.TIMEOUT,              # 6
+]
+pw_sent = 0
+while True:
+    i = child.expect(prompts)
+    if i == 0:
+        pw_sent += 1
+        if pw_sent > 2:          # don't hammer GT with a bad password (account lockout)
+            print("\ngtvpn: password rejected; fix it with `gtvpn setup`.", file=sys.stderr)
+            child.terminate(force=True); sys.exit(1)
+        child.sendline(password)
+    elif i == 1:
+        print(f"\n>>> Approve the Duo {duo} on your phone <<<", flush=True)
+        child.timeout = 120      # give Duo time
+        child.sendline(duo)
+    elif i == 2:
+        child.sendline(gateway)
+    elif i == 3:
+        child.sendline(user)
+    elif i == 4:
+        break
+    elif i == 5:
+        child.close(); sys.exit(child.exitstatus or 1)
+    else:
+        print("\ngtvpn: no response from server (network hiccup?) - try again.", file=sys.stderr)
+        child.terminate(force=True); sys.exit(1)
+
+# Tunnel is up: keep streaming openconnect's output until Ctrl-C.
+child.expect(r"\r?\n")         # finish the "Connected as ..." line
+print("\n>>> GT VPN connected. Leave this terminal open; Ctrl-C disconnects. <<<", flush=True)
+try:
+    child.expect(pexpect.EOF, timeout=None)
+except KeyboardInterrupt:
+    child.kill(signal.SIGINT)    # openconnect logs off cleanly on SIGINT
+    child.expect(pexpect.EOF, timeout=15)
+child.close()
+EOF
+)
+
+running() { [[ -f $PID_FILE ]] && sudo kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }
+
+connect() {
+    if running; then echo "GT VPN already connected."; exit 0; fi
+    [[ -s $USER_FILE ]] || setup
+    local user pass
+    user=$(<"$USER_FILE")
+    if ! pass=$(kr_get "$user" 2>/dev/null); then
+        echo "No password in KDE Wallet; running setup."; setup
+        user=$(<"$USER_FILE"); pass=$(kr_get "$user")
+    fi
+
+    local gw=${GTVPN_GATEWAY:-DC}; gw=${gw^^}
+    local server=${GTVPN_SERVER:-vpn.gatech.edu}
+    local usergroup=portal
+    [[ $server == *-gw.* ]] && usergroup=gateway
+
+    # Answer openconnect's prompts by what they ask for, not by position.
+    # sudo prompts on the real terminal; the password reaches the helper via stdin only.
+    printf '%s\n' "$pass" | sudo python3 -c "$HELPER" "$server" "$usergroup" "$PID_FILE" \
+        "$user" "${GTVPN_DUO:-push2}" "$gw Gateway"
+    echo "GT VPN disconnected."
+}
+
+case "${1:-on}" in
+    on|up|connect)  connect ;;
+    off|down|disconnect)
+        if running; then sudo kill -INT "$(cat "$PID_FILE")"; echo "GT VPN disconnected."
+        else echo "GT VPN not running."; fi ;;
+    status)  if running; then echo "connected (pid $(cat "$PID_FILE"))"; else echo "disconnected"; fi ;;
+    setup)   setup ;;
+    *) echo "usage: gtvpn [on|off|status|setup]"; exit 1 ;;
+esac
