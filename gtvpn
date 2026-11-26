@@ -48,7 +48,7 @@ prompts = [
     r"Challenge:",                # 1 Duo
     r"GATEWAY: \[[^\]]*\]:",       # 2 gateway choice
     r"Username:",                 # 3
-    r"Connected as",              # 4 tunnel up
+    r"Configured as|Connected as",  # 4 tunnel up (ESP prints "Configured as", SSL "Connected as")
     pexpect.EOF,                  # 5
     pexpect.TIMEOUT,              # 6
 ]
@@ -78,7 +78,7 @@ while True:
         child.terminate(force=True); sys.exit(1)
 
 # Tunnel is up: keep streaming openconnect's output until Ctrl-C.
-child.expect(r"\r?\n")         # finish the "Connected as ..." line
+child.expect(r"\r?\n")         # finish the "Configured as ..." line
 print("\n>>> GT VPN connected. Leave this terminal open; Ctrl-C disconnects. <<<", flush=True)
 try:
     child.expect(pexpect.EOF, timeout=None)
